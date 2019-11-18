@@ -5,6 +5,8 @@ import matplotlib.dates as mdate
 import datetime as dt
 import json
 import os
+import pickle
+from scipy.stats import multivariate_normal
 
 
 def read_data(path):
@@ -193,9 +195,9 @@ def draw_rssi_histograms(histograms, n_rows, n_cols):
     """plots the rssi level histogram of different BSSIDs
 
     Arguments:
-        histograms {dictionry} -- a dictionary of dictionaries 
+        histograms {dictionry} -- a dictionary of dictionaries
                                     containing bssid level for each bssid
-        n_rows {int} -- the number of subplot rows 
+        n_rows {int} -- the number of subplot rows
         n_cols {[type]} -- the number of subplot columns
     """
     i = 0
@@ -203,7 +205,7 @@ def draw_rssi_histograms(histograms, n_rows, n_cols):
         legends = []
         for label, rssi_list in histogram.items():
             ax = plt.subplot(n_rows, n_cols, i+1)
-            ax.hist(np.array(rssi_list), 10)
+            ax.hist(np.array(rssi_list), 15)
             legends.append(label)
         ax.legend(legends)
 
@@ -212,6 +214,98 @@ def draw_rssi_histograms(histograms, n_rows, n_cols):
         if (i >= n_cols*n_rows):
             break
     plt.show()
+
+
+def feature_set_from_histrogram(histograms, method="common", parameter=10, num_labels=3):
+    """specifies the feature_set with the given criteria
+
+    Arguments:
+        histograms {dictionary} -- a dictionary of dictinaries ({"bssid": {lable:[-45, -89, ...], ...})
+
+    Keyword Arguments:
+        method {str} -- the method for forming the feature_set (default: {"common"})
+        parameter {int} -- the parameter for the method [if required] (default: {10})
+        num_labels {int} -- number of labels in the data including "no_label" (default: {3})
+
+    Returns:
+        [list] -- a list of bssid (features)
+    """
+    feature_set = []
+    if method is "common":
+        for bssid, hist_dict in histograms.items():
+            num_common_features = 0
+            for label in hist_dict.keys():
+                if label != "no label" and len(hist_dict[label]) > parameter:
+                    num_common_features += 1
+            if num_common_features == num_labels - 1:
+                feature_set.append(bssid)
+
+    return feature_set
+
+
+def get_design_matrix(feature_set, data):
+    X = pd.DataFrame(columns=feature_set)
+    X_list = []
+    y = []
+    for sample in data:
+        if sample["label"] != "no label":
+            y.append(sample["label"])
+            sample_dict = {}
+            for feature in feature_set:
+                if feature in sample["rssi"]:
+                    sample_dict[feature] = sample["rssi"][feature]
+                else:
+                    sample_dict[feature] = -100
+            X_list.append(sample_dict)
+
+    X = pd.DataFrame(X_list, columns=feature_set)
+    return X, y
+
+
+def fit_GDA(X, y):
+    y = np.array(y)
+    classes = np.unique(np.array(y))
+    gaussians_params = {c: {"mu": None, "cov": None} for c in classes}
+    for c in classes:
+        X_c = X.iloc[np.where(y == c)[0]]
+        if X_c.size != 0:
+            gaussians_params[c]["mu"] = X_c.mean()
+            gaussians_params[c]["cov"] = X_c.cov()
+
+    return gaussians_params
+
+
+def save_model_GDA(model_params, file_name):
+    if not os.path.exists("./output"):
+        os.mkdir("./output")
+    pickle.dump(model_params, open("./output/" + file_name, "wb"))
+
+
+def load_model_GDA(file_name):
+    return pickle.load(open("./output/" + file_name, "rb"))
+
+
+def predict_GDA(model_params, test_data, y):
+    predictions = []
+    labels = model_params.keys()
+    for index, row in test_data.iterrows():
+        probs = calc_probability(model_params, row.values)
+        if probs[0] >= probs[1]:
+            print(list(model_params.keys())[0], y[index])
+        else:
+            print(list(model_params.keys())[1], y[index])
+
+    return predictions
+
+
+def calc_probability(model_params, sample):
+    probs = []
+    for c in model_params.keys():
+        mu = model_params[c]["mu"]
+        cov = model_params[c]["cov"]
+        probs.append(multivariate_normal.pdf(sample, mu.values, cov.values))
+    return probs
+
 
     # make json files
 make_json_files = False
@@ -230,17 +324,38 @@ if make_json_files:
     test_data = create_json_file(
         raw_data, labels=None, time_window=2, file_name="test_data")
 
-test_knn = True
+draw_hist = False
 
-if test_knn:
+if draw_hist:
     data_path = "./output"
     train_data = read_json_file(data_path, "train_data.json")
     test_data = read_json_file(data_path, "test_data.json")
     histograms = rssi_histogram(train_data)
-    draw_rssi_histograms(histograms, 6, 7)
-    x = 1
+    draw_rssi_histograms(histograms, 3, 4)
 
+train_model = True
+if train_model:
+    # load the training wifi log
+    data_path = "./output"
+    train_data = read_json_file(data_path, "train_data.json")
+    histograms = rssi_histogram(train_data)
+    feature_set = feature_set_from_histrogram(
+        histograms, method="common", parameter=35)
 
+    X, y = get_design_matrix(feature_set, train_data)
+    gaussian_params = fit_GDA(X, y)
+    save_model_GDA(gaussian_params, "GDA.pkl")
+
+# load the GDA model
+gaussian_params = load_model_GDA("GDA.pkl")
+
+# test on training data
+train_data = read_json_file(data_path, "train_data.json")
+histograms = rssi_histogram(train_data)
+feature_set = feature_set_from_histrogram(
+    histograms, method="common", parameter=35)
+X_test, y = get_design_matrix(feature_set, train_data)
+predictions = predict_GDA(gaussian_params, X_test, y)
 # bssid_list = list(wifi_log.keys())
 # train_data = data_complete_feature_set(raw_data, bssid_list, time_window=2)
 
